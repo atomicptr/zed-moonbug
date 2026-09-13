@@ -175,6 +175,10 @@ fn extension_install_dir() -> Result<PathBuf, String> {
 static RESOURCES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/resources");
 
 fn install_resources(location: &PathBuf) -> Result<(), String> {
+    if location.exists() {
+        return Ok(());
+    }
+
     std::fs::create_dir_all(location)
         .map_err(|e| format!("moonbug: could not create {}: {e}", location.display()))?;
 
