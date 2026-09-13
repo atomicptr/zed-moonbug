@@ -1,0 +1,85 @@
+{
+    "$schema": "https://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "allOf": [
+        {
+            "type": "object",
+            "required": [
+                "request"
+            ],
+            "properties": {
+                "request": {
+                    "type": "string",
+                    "enum": [
+                        "launch",
+                        "attach"
+                    ]
+                },
+                "host": {
+                    "type": "string",
+                    "default": "127.0.0.1"
+                },
+                "port": {
+                    "type": "integer",
+                    "default": 8888
+                },
+                "project_root_dir": {
+                    "type": "string",
+                    "default": "$ZED_WORKTREE_ROOT",
+                    "description": "Filesystem root used to resolve Lua source paths."
+                }
+            }
+        },
+        {
+            "if": {
+                "properties": {
+                    "request": {
+                        "const": "launch"
+                    }
+                },
+                "required": [
+                    "request"
+                ]
+            },
+            "then": {
+                "required": [
+                    "program"
+                ],
+                "properties": {
+                    "lua": {
+                        "type": "string",
+                        "default": "lua"
+                    },
+                    "program": {
+                        "type": "string",
+                        "default": "$ZED_FILE"
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "default": []
+                    }
+                }
+            }
+        },
+        {
+            "if": {
+                "properties": {
+                    "request": {
+                        "const": "attach"
+                    }
+                },
+                "required": [
+                    "request"
+                ]
+            },
+            "then": {
+                "required": [
+                    "port"
+                ]
+            }
+        }
+    ]
+}
