@@ -1653,13 +1653,14 @@ end
 
 ---@param body    function
 ---@param timeout number
----@return table
+---@return table? returns nil when timeout ran out
 local function run_with_timeout(body, timeout)
     local deadline = socket().gettime() + timeout
 
     local check_timeout = function()
         if socket().gettime() > deadline then
-            log.fatal("evaluation timed out after %ss", timeout)
+            log.error("evaluation timed out after %ss", timeout)
+            return nil
         end
     end
 
@@ -1786,7 +1787,9 @@ local function evaluate_expr(ordinal, src, timeout, context)
         setmetatable(env, {
             __index = _G,
             __newindex = function(_, key)
-                log.fatal(string.format("cannot assign to '%s' in a read-only context", tostring(key)), 2)
+                local err_message = string.format("cannot assign to '%s' in a read-only context", tostring(key))
+                log.error(err_message)
+                error(err_message, 2)
             end,
         })
     end
@@ -1798,6 +1801,10 @@ local function evaluate_expr(ordinal, src, timeout, context)
     local results = run_with_timeout(function()
         return fn(table_unpack(varargs))
     end, timeout)
+
+    if not results then
+        return false, "timeout", 0
+    end
 
     -- write back results if mutable
     if is_mutable then
@@ -2130,30 +2137,6 @@ local function capture_stacktrace()
     end
 
     return table.concat(parts, "\n")
-end
-
----@param host string?
----@param port integer?
----@return moonbug.Socket?
----@return string?
-local function bind(host, port)
-    resolve_libs()
-
-    local h = host or "127.0.0.1"
-    local p = port or tonumber(os.getenv "MOONBUG_PORT") or default_port
-
-    log.debug("attempt to listen on '%s:%d'", h, p)
-
-    local server, err = socket().bind(h, p)
-    if not server then
-        log.error("could not bind '%s:%d': %s", h, p, err)
-        return nil, err
-    end
-
-    log.debug("successfully bound socket to '%s:%d'", h, p)
-
-    server:settimeout(0)
-    return server, nil
 end
 
 local RequestHandler = {}
@@ -2606,6 +2589,10 @@ function RequestHandler.handle_evaluate(req)
         -- run inside timeout to guard from busy loading metamethods
         return serialize_eval_result(res, count)
     end, timeout)
+
+    if not result then
+        return
+    end
 
     if not result[1] then
         session_send_error(req, tostring(result[2]) or "failed to serialize evaluation result")
@@ -3092,11 +3079,13 @@ local function wrapped_error(message, level)
     maybe_pause_on_error(message)
 
     if level == 0 then
-        log.fatal(message, 0)
+        log.error(message)
+        error(message, 0)
         return
     end
 
-    log.fatal(message, (level or 1) + 1)
+    log.error(message)
+    error(message, (level or 1) + 1)
 end
 
 ---@param value any
@@ -3110,7 +3099,8 @@ local function wrapped_assert(value, ...)
 
     local message = select(1, ...) or "assertion failed!"
     maybe_pause_on_error(message)
-    log.fatal(message, 2)
+    log.error(message)
+    error(message, 2)
 end
 
 local function install_wrappers()
@@ -3513,6 +3503,30 @@ remove_debug_hook = function()
             end
         end
     end
+end
+
+---@param host string?
+---@param port integer?
+---@return moonbug.Socket?
+---@return string?
+local function bind(host, port)
+    resolve_libs()
+
+    local h = host or "127.0.0.1"
+    local p = port or tonumber(os.getenv "MOONBUG_PORT") or default_port
+
+    log.debug("attempt to listen on '%s:%d'", h, p)
+
+    local server, err = socket().bind(h, p)
+    if not server then
+        log.error("could not bind '%s:%d': %s", h, p, err)
+        return nil, err
+    end
+
+    log.debug("successfully bound socket to '%s:%d'", h, p)
+
+    server:settimeout(0)
+    return server, nil
 end
 
 ---@param host? string
