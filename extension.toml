@@ -1,4 +1,4 @@
-id = "moonbug"
+id = "moonbug-debugger"
 name = "moonbug"
 description = "Single-file Lua debugger - in-process hooks, remote DAP, no extra binary."
 version = "0.1.0"
