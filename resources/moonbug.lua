@@ -29,6 +29,9 @@ local eval_count_budget = 50000
 -- default seconds before `evaluate` is aborted
 local eval_default_timeout = 5
 
+-- pretty printer indent width
+local pp_indent_width = 2
+
 ---@type moonbug.dap.Capabilities
 local server_capabilities = {
     supportsCompletionsRequest = true,
@@ -40,9 +43,10 @@ local server_capabilities = {
     supportsLoadedSourcesRequest = true,
     supportsLogPoints = true,
     supportsModulesRequest = true,
-    -- supportsSetExpression = true, TODO: implement
+    supportsSetExpression = true,
     supportsSetVariable = true,
     supportsTerminateRequest = true,
+    supportsValueFormattingOptions = true,
 
     additionalModuleColumns = {
         { attributeName = "kind", label = "Kind" },
@@ -65,7 +69,7 @@ local hidden_keys = {
 ---@return { major: integer, minor: integer, patch: integer }|integer[] Returns integer array when flat is set
 function M.version(flat)
     if flat then
-        return version
+        return { version[1], version[2], version[3] }
     end
 
     return {
@@ -85,6 +89,7 @@ end
 local self_src = debug.getinfo(1, "S").source
 
 local is_luajit = rawget(_G, "jit") ~= nil
+local jit_off = is_luajit and rawget(_G, "jit").off or nil
 
 -- forward declarations
 local debug_hook
@@ -106,8 +111,8 @@ local require = require
 local xpcall = xpcall
 
 -- luajit: Turn off jit
-if is_luajit and jit.off then
-    jit.off()
+if is_luajit and jit_off then
+    jit_off()
 end
 
 ----> Compatibility & Polyfills
@@ -285,6 +290,82 @@ local log = {
 
 ----> Helpers
 
+---@param s      string
+---@param prefix string
+---@return boolean
+local function str_starts_with(s, prefix)
+    return s:sub(1, #prefix) == prefix
+end
+
+---Indent string
+---@param s     string
+---@param depth integer
+---@return string
+local function indent(s, depth)
+    return string.rep(" ", pp_indent_width * depth) .. s
+end
+
+---Serializes any Lua object into a string representation
+---@param value  any
+---@param depth? integer
+---@param seen?  table
+local function readable_tostring(value, depth, seen)
+    depth = depth or 0
+    seen = seen or {}
+
+    local t = type(value)
+
+    if t == "string" then
+        return string.format("%q", value)
+    elseif t ~= "table" then
+        if t == "function" or t == "thread" or t == "userdata" then
+            return string.format("<%s>", tostring(value))
+        end
+
+        return tostring(value)
+    end
+
+    if seen[value] then
+        return string.format("<%s>", tostring(value))
+    end
+
+    seen[value] = true
+
+    local parts = { string.format("{ -- %s", tostring(value)) }
+
+    local keys = {}
+
+    for k in pairs(value) do
+        table.insert(keys, k)
+    end
+
+    table.sort(keys, function(a, b)
+        return tostring(a) < tostring(b)
+    end)
+
+    local has_values = false
+
+    for _, k in ipairs(keys) do
+        local v = value[k]
+        local kv = string.format(
+            type(k) == "number" and "[%s] = %s," or "%s = %s,",
+            tostring(k),
+            readable_tostring(v, depth + 1, seen)
+        )
+
+        table.insert(parts, indent(kv, depth + 1))
+        has_values = true
+    end
+
+    if not has_values then
+        return indent(string.format("{} -- %s", tostring(value)), depth)
+    end
+
+    table.insert(parts, indent("}", depth))
+
+    return table.concat(parts, "\n")
+end
+
 local function resolve_json_lib()
     if M.compat.libs.json then
         return
@@ -360,7 +441,7 @@ end
 ---@param name string
 ---@return boolean
 local function is_pseudo_variable(name)
-    return name:sub(1, 1) == "("
+    return str_starts_with(name, "(")
 end
 
 ---@param v any
@@ -382,8 +463,6 @@ end
 ---@return any
 local function slice(list, start_index, count)
     -- no start and no limit: return the list as is
-    -- also according to spec, when count is 0 we should return everything
-    -- which we do... unless start index is set
     if not start_index and (count == nil or count == 0) then
         return list
     end
@@ -435,10 +514,14 @@ local function table_named_keys(tbl, length)
     return keys
 end
 
+---@param name string
+---@return string|number
 local function table_key_from_name(name)
     local n = name:match "^%[(%d+)%]$"
     if n then
-        return tonumber(n)
+        local res = tonumber(n)
+        ---@cast res number
+        return res
     end
 
     return name
@@ -458,6 +541,38 @@ local function table_named_count(tbl, length)
     end
 
     return n
+end
+
+---@param base string?
+---@param key  any
+---@return string?
+local function table_evaluate_name(base, key)
+    if not base then
+        return nil
+    end
+
+    local key_type = type(key)
+    if key_type == "string" then
+        key = string.format("%q", key)
+    elseif key_type == "number" then
+        key = tostring(key)
+    elseif key_type == "boolean" then
+        key = tostring(key)
+    else
+        return nil
+    end
+
+    return string.format("%s[%s]", base, key)
+end
+
+---@param name any
+---@return string?
+local function global_evaluate_name(name)
+    if type(name) ~= "string" then
+        return nil
+    end
+
+    return string.format("_G[%q]", name)
 end
 
 ---Converts camel case name to snake case
@@ -495,21 +610,55 @@ local dap_events = {
 ---@field command    string
 ---@field arguments? table
 
----@class moonbug.dap.Event : moonbug.dap.ProtocolMessage
----@field type  "event"
----@field event string
----@field body? any
+---@class moonbug.dap.AttachRequest : moonbug.dap.Request
+---@field command   "attach"
+---@field arguments moonbug.dap.AttachArguments
 
----@class moonbug.dap.Response : moonbug.dap.ProtocolMessage
----@field type        "response"
----@field request_seq integer
----@field success     boolean
----@field command     string
----@field message?    "cancelled"|"notStopped"|string
----@field body?       any
+---@class moonbug.dap.AttachArguments
+---@field project_root_dir? string
+---@field cwd?              string
+---@field workspaceFolder?  string
 
----@class moonbug.dap.ErrorResponse : moonbug.dap.Response
----@field body { error?: moonbug.dap.Message }
+---@class moonbug.dap.CompletionsRequest : moonbug.dap.Request
+---@field command   "completions"
+---@field arguments moonbug.dap.CompletionsArguments
+
+---@class moonbug.dap.CompletionsArguments
+---@field text     string
+---@field column   integer
+---@field frameId? integer
+
+---@class moonbug.dap.ConfigurationDoneRequest : moonbug.dap.Request
+---@field command   "configurationDone"
+---@field arguments table
+
+---@class moonbug.dap.ContinueRequest : moonbug.dap.Request
+---@field command   "continue"
+---@field arguments moonbug.dap.ContinueArguments
+
+---@class moonbug.dap.ContinueArguments
+---@field threadId integer
+
+---@class moonbug.dap.DisconnectRequest : moonbug.dap.Request
+---@field command   "disconnect"
+---@field arguments { restart?: boolean }
+
+---@class moonbug.dap.EvaluateRequest : moonbug.dap.Request
+---@field command   "evaluate"
+---@field arguments moonbug.dap.EvaluateArguments
+
+---@class moonbug.dap.EvaluateArguments
+---@field expression string
+---@field frameId?   integer
+---@field context?   "watch"|"repl"|"hover"|"clipboard"|"variables"
+---@field format?    moonbug.dap.ValueFormat
+
+---@class moonbug.dap.ExceptionInfoRequest : moonbug.dap.Request
+---@field command   "exceptionInfo"
+---@field arguments moonbug.dap.ExceptionInfoArguments
+
+---@class moonbug.dap.ExceptionInfoArguments
+---@field threadId integer
 
 ---@class moonbug.dap.InitializeRequest : moonbug.dap.Request
 ---@field command   "initialize"
@@ -534,9 +683,46 @@ local dap_events = {
 ---@field supportsStartDebuggingRequest?       boolean Supports `startDebugging` request.
 ---@field supportsANSIStyling?                 boolean Interprets ANSI escape sequences in output/variable fields.
 
----@class moonbug.dap.ConfigurationDoneRequest : moonbug.dap.Request
----@field command   "configurationDone"
----@field arguments table
+---@class moonbug.dap.LaunchRequest : moonbug.dap.Request
+---@field command   "launch"
+---@field arguments moonbug.dap.LaunchArguments
+
+---@class moonbug.dap.LaunchArguments
+---@field project_root_dir? string
+---@field cwd?              string
+---@field workspaceFolder?  string
+
+---@class moonbug.dap.LoadedSourcesRequest : moonbug.dap.Request
+---@field command "loadedSources"
+
+---@class moonbug.dap.ModulesRequest : moonbug.dap.Request
+---@field command   "modules"
+---@field arguments? moonbug.dap.ModulesArguments
+
+---@class moonbug.dap.ModulesArguments
+---@field startModule? integer
+---@field moduleCount? integer
+
+---@class moonbug.dap.NextRequest : moonbug.dap.Request
+---@field command   "next"
+---@field arguments moonbug.dap.NextArguments
+
+---@class moonbug.dap.NextArguments
+---@field threadId integer
+
+---@class moonbug.dap.PauseRequest : moonbug.dap.Request
+---@field command   "pause"
+---@field arguments moonbug.dap.PauseArguments
+
+---@class moonbug.dap.PauseArguments
+---@field threadId integer
+
+---@class moonbug.dap.ScopesRequest : moonbug.dap.Request
+---@field command   "scopes"
+---@field arguments moonbug.dap.ScopesArguments
+
+---@class moonbug.dap.ScopesArguments
+---@field frameId integer
 
 ---@class moonbug.dap.SetBreakpointsRequest : moonbug.dap.Request
 ---@field command   "setBreakpoints"
@@ -555,8 +741,24 @@ local dap_events = {
 ---@class moonbug.dap.SetExceptionBreakpointsArguments
 ---@field filters string[]
 
----@class moonbug.dap.ThreadsRequest : moonbug.dap.Request
----@field command "threads"
+---@class moonbug.dap.SetExpressionRequest : moonbug.dap.Request
+---@field command   "setExpression"
+---@field arguments moonbug.dap.SetExpressionArguments
+
+---@class moonbug.dap.SetExpressionArguments
+---@field expression string
+---@field value      string
+---@field frameId?   integer
+---@field format?    moonbug.dap.ValueFormat
+
+---@class moonbug.dap.SetVariableRequest : moonbug.dap.Request
+---@field command   "setVariable"
+---@field arguments moonbug.dap.SetVariableArguments
+
+---@class moonbug.dap.SetVariableArguments
+---@field variablesReference integer
+---@field name               string
+---@field value              string
 
 ---@class moonbug.dap.StackTraceRequest : moonbug.dap.Request
 ---@field command   "stackTrace"
@@ -564,27 +766,7 @@ local dap_events = {
 
 ---@class moonbug.dap.StackTraceArguments
 ---@field threadId integer
-
----@class moonbug.dap.ContinueRequest : moonbug.dap.Request
----@field command   "continue"
----@field arguments moonbug.dap.ContinueArguments
-
----@class moonbug.dap.ContinueArguments
----@field threadId integer
-
----@class moonbug.dap.PauseRequest : moonbug.dap.Request
----@field command   "pause"
----@field arguments moonbug.dap.PauseArguments
-
----@class moonbug.dap.PauseArguments
----@field threadId integer
-
----@class moonbug.dap.NextRequest : moonbug.dap.Request
----@field command   "next"
----@field arguments moonbug.dap.NextArguments
-
----@class moonbug.dap.NextArguments
----@field threadId integer
+---@field format?  moonbug.dap.StackFrameFormat
 
 ---@class moonbug.dap.StepInRequest : moonbug.dap.Request
 ---@field command   "stepIn"
@@ -600,12 +782,11 @@ local dap_events = {
 ---@class moonbug.dap.StepOutArguments
 ---@field threadId integer
 
----@class moonbug.dap.ScopesRequest : moonbug.dap.Request
----@field command   "scopes"
----@field arguments moonbug.dap.ScopesArguments
+---@class moonbug.dap.TerminateRequest : moonbug.dap.Request
+---@field command "terminate"
 
----@class moonbug.dap.ScopesArguments
----@field frameId integer
+---@class moonbug.dap.ThreadsRequest : moonbug.dap.Request
+---@field command "threads"
 
 ---@class moonbug.dap.VariablesRequest : moonbug.dap.Request
 ---@field command   "variables"
@@ -616,135 +797,115 @@ local dap_events = {
 ---@field filter?            "indexed"|"named"
 ---@field start?             integer
 ---@field count?             integer
+---@field format?            moonbug.dap.ValueFormat
 
----@class moonbug.dap.EvaluateRequest : moonbug.dap.Request
----@field command   "evaluate"
----@field arguments moonbug.dap.EvaluateArguments
+---@class moonbug.dap.Response : moonbug.dap.ProtocolMessage
+---@field type        "response"
+---@field request_seq integer
+---@field success     boolean
+---@field command     string
+---@field message?    "cancelled"|"notStopped"|string
+---@field body?       any
 
----@class moonbug.dap.EvaluateArguments
----@field expression string
----@field frameId?   integer
----@field context?   "watch"|"repl"|"hover"|"clipboard"|"variables"
+---@class moonbug.dap.ErrorResponse : moonbug.dap.Response
+---@field body { error?: moonbug.dap.Message }
 
----@class moonbug.dap.CompletionsRequest : moonbug.dap.Request
----@field command   "completions"
----@field arguments moonbug.dap.CompletionsArguments
+---@class moonbug.dap.CompletionsResponseBody
+---@field targets moonbug.dap.CompletionItem[]
 
----@class moonbug.dap.CompletionsArguments
----@field text     string
----@field column   integer
----@field frameId? integer
+---@class moonbug.dap.ContinueResponseBody
+---@field allThreadsContinued? boolean
 
----@class moonbug.dap.LoadedSourcesRequest : moonbug.dap.Request
----@field command "loadedSources"
+---@class moonbug.dap.ErrorResponseBody
+---@field error moonbug.dap.Message
 
----@class moonbug.dap.ModulesRequest : moonbug.dap.Request
----@field command   "modules"
----@field arguments? moonbug.dap.ModulesArguments
-
----@class moonbug.dap.ModulesArguments
----@field startModule? integer
----@field moduleCount? integer
-
----@class moonbug.dap.ExceptionInfoRequest : moonbug.dap.Request
----@field command   "exceptionInfo"
----@field arguments moonbug.dap.ExceptionInfoArguments
-
----@class moonbug.dap.ExceptionInfoArguments
----@field threadId integer
-
----@class moonbug.dap.LaunchRequest : moonbug.dap.Request
----@field command   "launch"
----@field arguments moonbug.dap.LaunchArguments
-
----@class moonbug.dap.LaunchArguments
----@field project_root_dir? string
----@field cwd?              string
----@field workspaceFolder?  string
-
----@class moonbug.dap.AttachRequest : moonbug.dap.Request
----@field command   "attach"
----@field arguments moonbug.dap.AttachArguments
-
----@class moonbug.dap.AttachArguments
----@field project_root_dir? string
----@field cwd?              string
----@field workspaceFolder?  string
-
----@class moonbug.dap.DisconnectRequest : moonbug.dap.Request
----@field command "disconnect"
-
----@class moonbug.dap.TerminateRequest : moonbug.dap.Request
----@field command "terminate"
-
----@class moonbug.dap.SetVariableRequest : moonbug.dap.Request
----@field command   "setVariable"
----@field arguments moonbug.dap.SetVariableArguments
-
----@class moonbug.dap.SetVariableArguments
+---@class moonbug.dap.EvaluateResponseBody
+---@field result             string
+---@field type?              string
+---@field presentationHint?  moonbug.dap.VariablePresentationHint
 ---@field variablesReference integer
----@field name               string
----@field value              string
+---@field namedVariables?    integer
+---@field indexedVariables?  integer
 
----@class moonbug.dap.SetExpressionRequest : moonbug.dap.Request
----@field command   "setExpression"
----@field arguments moonbug.dap.SetExpressionArguments
+---@class moonbug.dap.ExceptionInfoDetails
+---@field message?        string
+---@field typeName?       string
+---@field fullTypeName?   string
+---@field evaluateName?   string
+---@field stackTrace?     string
+---@field innerException? moonbug.dap.ExceptionInfoDetails[]
 
----@class moonbug.dap.SetExpressionArguments
----@field expression string
----@field value      string
----@field frameId?   integer
+---@class moonbug.dap.ExceptionInfoResponseBody
+---@field exceptionId  string
+---@field description? string
+---@field breakMode    "never"|"always"|"unhandled"|"userUnhandled"
+---@field details?     moonbug.dap.ExceptionInfoDetails
 
----@class moonbug.dap.Message
----@field id         integer
----@field format     string
----@field variables? table<string, string>
+---@class moonbug.dap.LoadedSourcesResponseBody
+---@field sources moonbug.dap.Source[]
 
----@class moonbug.dap.Variable
----@field name                string
+---@class moonbug.dap.ModulesResponseBody
+---@field modules      moonbug.dap.Module[]
+---@field totalModules integer
+
+---@alias moonbug.dap.ResponseBody
+---| moonbug.dap.Capabilities
+---| moonbug.dap.CompletionsResponseBody
+---| moonbug.dap.ContinueResponseBody
+---| moonbug.dap.ErrorResponseBody
+---| moonbug.dap.EvaluateResponseBody
+---| moonbug.dap.ExceptionInfoResponseBody
+---| moonbug.dap.LoadedSourcesResponseBody
+---| moonbug.dap.ModulesResponseBody
+---| moonbug.dap.ScopesResponseBody
+---| moonbug.dap.SetBreakpointsResponseBody
+---| moonbug.dap.SetExpressionResponseBody
+---| moonbug.dap.SetVariableResponseBody
+---| moonbug.dap.StackTraceResponseBody
+---| moonbug.dap.ThreadsResponseBody
+---| moonbug.dap.VariablesResponseBody
+
+---@class moonbug.dap.ScopesResponseBody
+---@field scopes moonbug.dap.Scope[]
+
+---@class moonbug.dap.SetBreakpointsResponseBody
+---@field breakpoints moonbug.dap.Breakpoint[]
+
+---@class moonbug.dap.SetExpressionResponseBody
 ---@field value               string
 ---@field type?               string
----@field variablesReference  integer
----@field indexedVariables?   integer
----@field namedVariables?     integer
 ---@field presentationHint?   moonbug.dap.VariablePresentationHint
+---@field variablesReference  integer
+---@field namedVariables?     integer
+---@field indexedVariables?   integer
 
----@class moonbug.dap.VariablePresentationHint
----@field kind?       "property"|"method"|"class"|"data"|"event"|"baseClass"|"innerClass"|"interface"|"mostDerivedClass"|"virtual"|"dataBreakpoint"
----@field attributes? ("static"|"constant"|"readOnly"|"rawString"|"hasObjectId"|"canHaveObjectId"|"hasSideEffects"|"hasDataBreakpoint")[]
----@field visibility? "public"|"private"|"protected"|"internal"|"final"
----@field lazy?       boolean
+---@alias moonbug.dap.SetVariableResponseBody moonbug.dap.Variable
 
----@class moonbug.dap.Scope
----@field name                string
----@field variablesReference? integer
----@field presentationHint?   "arguments"|"locals"|"registers"|"returnValue"|string
----@field expensive           boolean
+---@class moonbug.dap.StackTraceResponseBody
+---@field stackFrames moonbug.dap.StackFrame[]
+---@field totalFrames? integer
 
----@class moonbug.dap.ExceptionBreakpointsFilter
----@field filter       string
----@field label        string
----@field description? string
----@field default?     boolean
+---@class moonbug.dap.ThreadsResponseBody
+---@field threads moonbug.dap.Thread[]
 
----@class moonbug.dap.ColumnDescriptor
----@field attributeName string
----@field label         string
----@field format?       string
----@field type?         "string"|"number"|"boolean"|"unixTimestampUTC"
----@field width?        integer
+---@class moonbug.dap.VariablesResponseBody
+---@field variables moonbug.dap.Variable[]
 
----@alias moonbug.dap.ChecksumAlgorithm "MD5"|"SHA1"|"SHA256"|"timestamp"
+---@class moonbug.dap.Breakpoint
+---@field id?                    integer
+---@field verified               boolean
+---@field message?               string
+---@field source?                moonbug.dap.Source
+---@field line?                  integer
+---@field column?                integer
+---@field instructionReference?  string
+---@field offset?                integer
 
 ---@class moonbug.dap.BreakpointMode
 ---@field mode         string
 ---@field label        string
 ---@field description? string
 ---@field appliesTo    "source"|"exception"|"instruction"|"string"
-
----@class moonbug.dap.Source
----@field name? string Short name of the source
----@field path? string Path of the source shown in UI
 
 ---@class moonbug.dap.Capabilities
 ---@field supportsConfigurationDoneRequest?      boolean Supports `configurationDone` request.
@@ -790,6 +951,15 @@ local dap_events = {
 ---@field breakpointModes?                       moonbug.dap.BreakpointMode[] Supported breakpoint modes.
 ---@field supportsANSIStyling?                   boolean Supports ANSI escape sequences in output/variable fields.
 
+---@alias moonbug.dap.ChecksumAlgorithm "MD5"|"SHA1"|"SHA256"|"timestamp"
+
+---@class moonbug.dap.ColumnDescriptor
+---@field attributeName string
+---@field label         string
+---@field format?       string
+---@field type?         "string"|"number"|"boolean"|"unixTimestampUTC"
+---@field width?        integer
+
 ---@class moonbug.dap.CompletionItem
 ---@field label   string
 ---@field text?   string
@@ -797,12 +967,44 @@ local dap_events = {
 ---@field start?  integer
 ---@field length? integer
 
----@class moonbug.dap.StackFrame
----@field id      integer
----@field name    string
----@field source? moonbug.dap.Source
----@field line    integer
----@field column  integer
+---@class moonbug.dap.Event : moonbug.dap.ProtocolMessage
+---@field type  "event"
+---@field event string
+---@field body? any
+
+---@class moonbug.dap.ExceptionBreakpointsFilter
+---@field filter       string
+---@field label        string
+---@field description? string
+---@field default?     boolean
+
+---@class moonbug.dap.Message
+---@field id         integer
+---@field format     string
+---@field variables? table<string, string>
+
+---@class moonbug.dap.Module
+---@field id              integer
+---@field name            string
+---@field path?           string
+---@field isOptimized?    boolean
+---@field isUserCode?     boolean
+---@field version?        string
+---@field symbolStatus?   string
+---@field symbolFilePath? string
+---@field dateTimeStamp?  string
+---@field addressRange?   string
+---@field kind?           string
+
+---@class moonbug.dap.Scope
+---@field name                string
+---@field variablesReference? integer
+---@field presentationHint?   "arguments"|"locals"|"registers"|"returnValue"|string
+---@field expensive           boolean
+
+---@class moonbug.dap.Source
+---@field name? string Short name of the source
+---@field path? string Path of the source shown in UI
 
 ---@class moonbug.dap.SourceBreakpoint
 ---@field line          integer
@@ -811,6 +1013,45 @@ local dap_events = {
 ---@field hitCondition? string
 ---@field logMessage?   string
 ---@field mode?         string
+
+---@class moonbug.dap.StackFrame
+---@field id      integer
+---@field name    string
+---@field source? moonbug.dap.Source
+---@field line    integer
+---@field column  integer
+
+---@class moonbug.dap.StackFrameFormat : moonbug.dap.ValueFormat
+---@field parameters?      boolean Display stack frame parameters.
+---@field parameterTypes?  boolean Display stack frame parameter types.
+---@field parameterNames?  boolean Display stack frame parameter names.
+---@field parameterValues? boolean Display stack frame parameter values.
+---@field line?            boolean Display line numbers in frame names.
+---@field module?          boolean Display module names in frame names.
+---@field includeAll?      boolean Include hidden and non-user frames.
+
+---@class moonbug.dap.Thread
+---@field id   integer
+---@field name string
+
+---@class moonbug.dap.ValueFormat
+---@field hex? boolean Display the value in hexadecimal.
+
+---@class moonbug.dap.Variable
+---@field name                string
+---@field value               string
+---@field type?               string
+---@field evaluateName?       string
+---@field variablesReference  integer
+---@field indexedVariables?   integer
+---@field namedVariables?     integer
+---@field presentationHint?   moonbug.dap.VariablePresentationHint
+
+---@class moonbug.dap.VariablePresentationHint
+---@field kind?       "property"|"method"|"class"|"data"|"event"|"baseClass"|"innerClass"|"interface"|"mostDerivedClass"|"virtual"|"dataBreakpoint"
+---@field attributes? ("static"|"constant"|"readOnly"|"rawString"|"hasObjectId"|"canHaveObjectId"|"hasSideEffects"|"hasDataBreakpoint")[]
+---@field visibility? "public"|"private"|"protected"|"internal"|"final"
+---@field lazy?       boolean
 
 ---@param client moonbug.Socket
 ---@return integer?
@@ -910,7 +1151,7 @@ end
 ---@param p string
 ---@return boolean
 local function path_is_absolute(p)
-    return p:sub(1, 1) == "/" or p:match "^%a+:" ~= nil
+    return str_starts_with(p, "/") or p:match "^%a+:" ~= nil
 end
 
 ---@param ... string
@@ -939,7 +1180,7 @@ local function path_normalize(p)
 
     p = p:gsub("^@", ""):gsub("\\", "/")
 
-    local is_posix = p:sub(1, 1) == "/"
+    local is_posix = str_starts_with(p, "/")
     local parts = {}
 
     for part in p:gmatch "[^/]+" do
@@ -1067,8 +1308,8 @@ local start_port = nil
 ---@type moonbug.Config?
 local start_opts = nil
 
----@param with_reconnect? boolean
-local function session_reset(with_reconnect)
+---@param with_restart? boolean
+local function session_reset(with_restart)
     log.debug "resetting session..."
 
     session.seq = 0
@@ -1115,8 +1356,8 @@ local function session_reset(with_reconnect)
 
     session.server = nil
 
-    if with_reconnect then
-        log.debug "reconnecting session..."
+    if with_restart then
+        log.debug "restarting session..."
 
         local opts = start_opts or {}
         opts.wait = false -- dont wait on reconnect
@@ -1348,6 +1589,52 @@ local function frame_setlocal(handle, ordinal, index, value)
     end
 end
 
+---@param value integer?
+---@param field "line"|"column"
+---@return integer?
+local function position_from_client(value, field)
+    if not value then
+        return nil
+    end
+
+    assert(field == "column" or field == "line")
+
+    if not session.client_args then
+        return value
+    end
+
+    local startsAt1 = field == "line" and session.client_args.linesStartAt1 or session.client_args.columnsStartAt1
+
+    if startsAt1 == false then
+        return value + 1
+    end
+
+    return value
+end
+
+---@param value integer?
+---@param field "line"|"column"
+---@return integer?
+local function position_to_client(value, field)
+    if not value then
+        return nil
+    end
+
+    assert(field == "column" or field == "line")
+
+    if not session.client_args then
+        return value
+    end
+
+    local startsAt1 = field == "line" and session.client_args.linesStartAt1 or session.client_args.columnsStartAt1
+
+    if startsAt1 == false then
+        return value - 1
+    end
+
+    return value
+end
+
 ---@param object moonbug.dap.ProtocolMessage
 local function session_send_seq(object)
     session.seq = session.seq + 1
@@ -1371,8 +1658,9 @@ end
 ---@param output   string
 ---@param source?  moonbug.dap.Source
 ---@param line?    integer
+---@param column?  integer
 ---@return boolean
-local function session_send_output(category, output, source, line)
+local function session_send_output(category, output, source, line, column)
     if not session.ready or not session.client then
         return false
     end
@@ -1381,14 +1669,15 @@ local function session_send_output(category, output, source, line)
         category = category,
         output = output,
         source = source,
-        line = line,
+        line = position_to_client(line, "line"),
+        column = position_to_client(column, "column"),
     })
     return true
 end
 
 ---@param req      moonbug.dap.Request
 ---@param ok       boolean
----@param body?    table
+---@param body?    moonbug.dap.ResponseBody
 ---@param message? "cancelled"|"notStopped"|string
 local function session_send_response(req, ok, body, message)
     session_send_seq {
@@ -1407,7 +1696,11 @@ end
 ---@param message string
 local function session_send_error(req, message)
     log.error(message)
-    session_send_response(req, false, { error = { id = 1, format = message } }, message)
+
+    ---@type moonbug.dap.ErrorResponseBody
+    local body = { error = { id = 1, format = message } }
+
+    session_send_response(req, false, body, message)
 end
 
 ---@param req moonbug.dap.Request
@@ -1418,6 +1711,7 @@ local function session_requires_pause(req)
     end
 
     session_send_response(req, false, nil, "notStopped")
+
     return false
 end
 
@@ -1466,11 +1760,26 @@ local function count_upvalues(fn)
     return n
 end
 
----Client facing tostring values
+---Format values for the client
 ---@param v any
+---@param format? moonbug.dap.ValueFormat
 ---@return string
-local function client_value_tostring(v)
+local function format_client_value(v, format)
     local t = type(v)
+
+    if format and format.hex and t == "number" then
+        local specifier = v % 1 == 0 and "0x%x" or "%a"
+        local ok, formatted = pcall(string.format, specifier, v)
+        if ok then
+            return formatted
+        end
+        if specifier ~= "%a" then
+            ok, formatted = pcall(string.format, "%a", v)
+            if ok then
+                return formatted
+            end
+        end
+    end
 
     if t == "string" then
         return string.format("%q", v)
@@ -1507,7 +1816,9 @@ local function variable_ref(kind, data)
 end
 
 ---@class moonbug.VariableConfig
----@field context? "table"|"locals"|"upvalues"|"globals"|"eval"
+---@field context?       "table"|"locals"|"upvalues"|"globals"|"eval"
+---@field evaluate_name? string
+---@field format?        moonbug.dap.ValueFormat
 
 ---@param v     any
 ---@param name  string
@@ -1521,7 +1832,7 @@ local function variable_presentation_hint(v, name, opts)
     ---@type moonbug.dap.VariablePresentationHint
     local res = { attributes = {} }
 
-    if name:sub(1, 1) == "_" and name ~= "_G" and name ~= "_ENV" and opts.context ~= "eval" then
+    if str_starts_with(name, "_") and name ~= "_G" and name ~= "_ENV" and opts.context ~= "eval" then
         res.visibility = "private"
     end
 
@@ -1563,15 +1874,16 @@ local function serialize_value(v, name, opts)
     local variable = {
         name = name,
         type = type(v),
-        value = client_value_tostring(v),
+        value = format_client_value(v, opts and opts.format),
         variablesReference = 0,
         presentationHint = variable_presentation_hint(v, name, opts),
+        evaluateName = opts and opts.evaluate_name,
     }
 
     if type(v) == "table" then
         local length = table_array_length(v)
 
-        variable.variablesReference = variable_ref("table", { tbl = v })
+        variable.variablesReference = variable_ref("table", { tbl = v, evaluate_name = opts and opts.evaluate_name })
         variable.indexedVariables = length
         variable.namedVariables = table_named_count(v, length)
     end
@@ -1580,23 +1892,32 @@ local function serialize_value(v, name, opts)
 end
 
 ---@return moonbug.dap.Variable[]
-local function global_variables()
+local function global_variables(format)
     local keys = global_keys()
     local vars = {}
 
     for _, k in ipairs(keys) do
-        table.insert(vars, serialize_value(_G[k], tostring(k), { context = "globals" }))
+        table.insert(
+            vars,
+            serialize_value(_G[k], tostring(k), {
+                context = "globals",
+                evaluate_name = global_evaluate_name(k),
+                format = format,
+            })
+        )
     end
 
     return vars
 end
 
----@param tbl          table
----@param filter?      "indexed"|"named"
----@param start_index? integer
----@param count?       integer
+---@param tbl            table
+---@param filter?        "indexed"|"named"
+---@param start_index?   integer
+---@param count?         integer
+---@param evaluate_name? string
+---@param format?        moonbug.dap.ValueFormat
 ---@return moonbug.dap.Variable[]
-local function table_variables(tbl, filter, start_index, count)
+local function table_variables(tbl, filter, start_index, count, evaluate_name, format)
     local length = table_array_length(tbl)
     start_index = start_index or 0
 
@@ -1608,7 +1929,14 @@ local function table_variables(tbl, filter, start_index, count)
 
         for i = start_index + 1, hi do
             local v = rawget(tbl, i)
-            table.insert(vars, serialize_value(v, string.format("[%d]", i), { context = "table" }))
+            table.insert(
+                vars,
+                serialize_value(v, string.format("[%d]", i), {
+                    context = "table",
+                    evaluate_name = table_evaluate_name(evaluate_name, i),
+                    format = format,
+                })
+            )
         end
 
         return vars
@@ -1621,8 +1949,16 @@ local function table_variables(tbl, filter, start_index, count)
         local hi = (count and count ~= 0) and math.min(start_index + count, total) or math.min(total, table_max_items)
 
         for i = start_index + 1, hi do
-            local v = rawget(tbl, keys[i])
-            table.insert(vars, serialize_value(v, tostring(keys[i]), { context = "table" }))
+            local key = keys[i]
+            local v = rawget(tbl, key)
+            table.insert(
+                vars,
+                serialize_value(v, tostring(key), {
+                    context = "table",
+                    evaluate_name = table_evaluate_name(evaluate_name, key),
+                    format = format,
+                })
+            )
         end
 
         return vars
@@ -1634,11 +1970,25 @@ local function table_variables(tbl, filter, start_index, count)
     for i = start_index + 1, hi do
         if i <= length then
             local v = rawget(tbl, i)
-            table.insert(vars, serialize_value(v, string.format("[%d]", i), { context = "table" }))
+            table.insert(
+                vars,
+                serialize_value(v, string.format("[%d]", i), {
+                    context = "table",
+                    evaluate_name = table_evaluate_name(evaluate_name, i),
+                    format = format,
+                })
+            )
         else
             local k = keys[i - length]
             local v = rawget(tbl, k)
-            table.insert(vars, serialize_value(v, tostring(k), { context = "table" }))
+            table.insert(
+                vars,
+                serialize_value(v, tostring(k), {
+                    context = "table",
+                    evaluate_name = table_evaluate_name(evaluate_name, k),
+                    format = format,
+                })
+            )
         end
     end
 
@@ -1653,14 +2003,16 @@ end
 
 ---@param body    function
 ---@param timeout number
----@return table? returns nil when timeout ran out
+---@return table?  result
+---@return string? error
 local function run_with_timeout(body, timeout)
     local deadline = socket().gettime() + timeout
+    local timeout_marker = {}
 
     local check_timeout = function()
         if socket().gettime() > deadline then
             log.error("evaluation timed out after %ss", timeout)
-            return nil
+            error(timeout_marker, 0)
         end
     end
 
@@ -1679,10 +2031,14 @@ local function run_with_timeout(body, timeout)
         debug.sethook()
     end
 
-    return results
+    if not results[1] and results[2] == timeout_marker then
+        return nil, "timeout"
+    end
+
+    return results, nil
 end
 
----@param ordinal    integer
+---@param ordinal? integer nil evaluates in the global scope
 ---@param src      string
 ---@param timeout? number
 ---@param context? "repl"|"watch"|"hover"|"clipboard"|"variables"
@@ -1692,24 +2048,33 @@ end
 local function evaluate_expr(ordinal, src, timeout, context)
     context = context or "repl"
 
-    local level = 2 -- 1 = this function
-    local seen = 0
+    ---@type integer?
+    local level = nil
+    ---@type function?
+    local func = nil
 
-    while true do
-        local info = debug.getinfo(level, "S")
-        if not info then
-            return false, "stack frame is no longer valid", 0
-        end
+    if ordinal then
+        level = 2 -- 1 = this function
+        local seen = 0
 
-        if is_user_frame(info) then
-            seen = seen + 1
-
-            if seen == ordinal then
-                break
+        while true do
+            local info = debug.getinfo(level, "S")
+            if not info then
+                return false, "stack frame is no longer valid", 0
             end
+
+            if is_user_frame(info) then
+                seen = seen + 1
+
+                if seen == ordinal then
+                    break
+                end
+            end
+
+            level = level + 1
         end
 
-        level = level + 1
+        func = debug.getinfo(level, "f").func
     end
 
     -- only repl context allows mutations
@@ -1721,64 +2086,63 @@ local function evaluate_expr(ordinal, src, timeout, context)
     ---@type string|nil
     local err
 
-    if is_mutable then
-        fn, err = loadstring(src, "=(moonbug eval)")
-    end
+    fn, err = loadstring(string.format("return %s", src), "=(moonbug eval)")
 
-    if not fn then
-        fn, err = loadstring(string.format("return %s", src), "=(moonbug eval)")
+    if not fn and is_mutable then
+        fn, err = loadstring(src, "=(moonbug eval)")
     end
 
     if not fn then
         return false, err or "syntax error", 0
     end
 
-    -- create a snapshot of the frames locals/upvalues
+    -- Create a snapshot of the frames locals/upvalues, or an empty global scope.
     local env = {}
-    local func = debug.getinfo(level, "f").func
-    local i = 1
-
-    while true do
-        local name, value = debug.getupvalue(func, i)
-
-        if not name then
-            break
-        end
-
-        if not is_pseudo_variable(name) then
-            env[name] = value
-        end
-
-        i = i + 1
-    end
-
-    i = 1
-
-    while true do
-        local name, value = debug.getlocal(level, i)
-
-        if not name then
-            break
-        end
-
-        if not is_pseudo_variable(name) then
-            env[name] = value
-        end
-
-        i = i + 1
-    end
-
     local varargs = {}
-    i = 1
 
-    while true do
-        local name, value = debug.getlocal(level, -i)
-        if not name then
-            break
+    if level and func then
+        local i = 1
+
+        while true do
+            local name, value = debug.getupvalue(func, i)
+            if not name then
+                break
+            end
+
+            if not is_pseudo_variable(name) then
+                env[name] = value
+            end
+
+            i = i + 1
         end
 
-        varargs[i] = value
-        i = i + 1
+        i = 1
+
+        while true do
+            local name, value = debug.getlocal(level, i)
+            if not name then
+                break
+            end
+
+            if not is_pseudo_variable(name) then
+                env[name] = value
+            end
+
+            i = i + 1
+        end
+
+        i = 1
+
+        while true do
+            local name, value = debug.getlocal(level, -i)
+            if not name then
+                break
+            end
+
+            varargs[i] = value
+
+            i = i + 1
+        end
     end
 
     if is_mutable then
@@ -1798,16 +2162,16 @@ local function evaluate_expr(ordinal, src, timeout, context)
 
     timeout = timeout or eval_timeout()
 
-    local results = run_with_timeout(function()
+    local results, timeout_err = run_with_timeout(function()
         return fn(table_unpack(varargs))
     end, timeout)
 
     if not results then
-        return false, "timeout", 0
+        return false, timeout_err or "timeout", 0
     end
 
     -- write back results if mutable
-    if is_mutable then
+    if is_mutable and level and func then
         local n = 0
         while debug.getlocal(level, n + 1) do
             n = n + 1
@@ -1859,15 +2223,16 @@ local function evaluate_expr(ordinal, src, timeout, context)
     return true, values, count
 end
 
----@param v     table<integer, any>
----@param count integer
----@return table
-local function serialize_eval_result(v, count)
+---@param v       table<integer, any>
+---@param count   integer
+---@param format? moonbug.dap.ValueFormat
+---@return moonbug.dap.EvaluateResponseBody
+local function serialize_eval_result(v, count, format)
     if count ~= 1 then
         local parts = {}
 
         for i = 1, count do
-            parts[i] = tostring(v[i])
+            parts[i] = format_client_value(v[i], format)
         end
 
         return {
@@ -1876,7 +2241,11 @@ local function serialize_eval_result(v, count)
         }
     end
 
-    local s = serialize_value(v[1], "result", { context = "eval" })
+    local s = serialize_value(v[1], "result", {
+        context = "eval",
+        format = format,
+    })
+
     return {
         result = s.value,
         type = s.type,
@@ -1932,7 +2301,7 @@ local function complete_identifiers(handle, ordinal, prefix)
             and not seen[name]
             and not is_pseudo_variable(name)
             and not hidden_keys[name]
-            and name:sub(1, #prefix) == prefix
+            and str_starts_with(name, prefix)
         then
             seen[name] = true
             table.insert(targets, {
@@ -1951,12 +2320,14 @@ local function complete_identifiers(handle, ordinal, prefix)
         end
 
         add(name)
+
         i = i + 1
     end
 
     local info = frame_getinfo(handle, ordinal, "f")
     if info and info.func then
         local j = 1
+
         while true do
             local name = debug.getupvalue(info.func, j)
             if not name then
@@ -1964,6 +2335,7 @@ local function complete_identifiers(handle, ordinal, prefix)
             end
 
             add(name)
+
             j = j + 1
         end
     end
@@ -2021,9 +2393,9 @@ local function complete_fields(tbl, prefix, separator)
     for name in pairs(seen) do
         if
             -- hide internals
-            name:sub(1, 2) ~= "__"
+            not str_starts_with(name, "__")
             -- name starts with prefix
-            and name:sub(1, #prefix) == prefix
+            and str_starts_with(name, prefix)
         then
             local value = tbl[name]
 
@@ -2060,7 +2432,7 @@ local function determine_module_path(module_value)
     ---@return string?
     local function from_function(fn)
         local info = debug.getinfo(fn, "S")
-        if info and info.source and info.source:sub(1, 1) == "@" then
+        if info and info.source and str_starts_with(info.source, "@") then
             local path = path_resolve(info.source, session.project_root_dir)
             if path ~= "" then
                 return path
@@ -2086,13 +2458,14 @@ local function determine_module_path(module_value)
     return nil
 end
 
----comment
+---Registers a loaded Lua module and returns its DAP representation.
 ---@param name string
----@return { id: integer, name: string, path?: string, kind?: string }|nil
+---@return moonbug.dap.Module
 local function register_module(name)
     local existing = session.module_ids[name]
     local value = package.loaded[name]
 
+    ---@type moonbug.dap.Module
     local row = {
         id = existing or session.next_module_id,
         name = name,
@@ -2146,22 +2519,7 @@ function RequestHandler.handle_initialize(req)
     local args = req.arguments or {}
     session.client_args = args
 
-    -- sort client args/caps by key and print them
-    local keys = {}
-
-    for key in pairs(args) do
-        table.insert(keys, key)
-    end
-
-    table.sort(keys)
-
-    for _, k in ipairs(keys) do
-        local v = args[k]
-
-        if v then
-            log.debug("client:%s: %s", k, tostring(v))
-        end
-    end
+    log.info("client initialized request: %s", readable_tostring(args))
 
     session_send_response(req, true, server_capabilities)
     session_send_event(dap_events.initialized)
@@ -2191,12 +2549,13 @@ function RequestHandler.handle_set_breakpoints(req)
         session.sources[path] = true
     end
 
+    ---@type moonbug.dap.Breakpoint[]
     local list = {}
 
     session.breakpoints[path] = {}
 
     for _, bp in ipairs(args.breakpoints or {}) do
-        local line = bp.line
+        local line = position_from_client(bp.line, "line")
         local ok = path ~= "" and line ~= nil
 
         if ok then
@@ -2212,6 +2571,7 @@ function RequestHandler.handle_set_breakpoints(req)
 
             log.debug("    set breakpoint: %s:%d%s", path, line, condition)
 
+            ---@cast line integer
             session.breakpoints[path][line] = {
                 condition = bp.condition,
                 hit_condition = bp.hitCondition,
@@ -2220,10 +2580,13 @@ function RequestHandler.handle_set_breakpoints(req)
             }
         end
 
-        table.insert(list, { line = line, verified = ok })
+        table.insert(list, { line = position_to_client(line, "line"), verified = ok })
     end
 
-    session_send_response(req, true, { breakpoints = list })
+    ---@type moonbug.dap.SetBreakpointsResponseBody
+    local body = { breakpoints = list }
+
+    session_send_response(req, true, body)
 end
 
 ---@param req moonbug.dap.SetExceptionBreakpointsRequest
@@ -2236,6 +2599,7 @@ function RequestHandler.handle_set_exception_breakpoints(req)
     session.filters.error = on.error or false
     session.filters.pcall = on.pcall or false
     session.filters.uncaught = on.uncaught or false
+
     session_send_response(req, true)
 end
 
@@ -2243,7 +2607,7 @@ end
 function RequestHandler.handle_threads(req)
     purge_dead_threads()
 
-    ---@type { id: number, name: string }[]
+    ---@type moonbug.dap.Thread[]
     local threads = {}
 
     for h, c in pairs(session.context) do
@@ -2263,13 +2627,78 @@ function RequestHandler.handle_threads(req)
         return a.id < b.id
     end)
 
-    session_send_response(req, true, { threads = threads })
+    ---@type moonbug.dap.ThreadsResponseBody
+    local body = { threads = threads }
+
+    session_send_response(req, true, body)
+end
+
+---@param name     string?
+---@param value    any
+---@param index    integer
+---@param format   moonbug.dap.StackFrameFormat
+---@param defaults boolean
+---@return string?
+local function format_stack_parameter(name, value, index, format, defaults)
+    local rendered = nil
+
+    if format.parameterNames == true or defaults then
+        rendered = name or string.format("arg%d", index)
+    end
+
+    if format.parameterTypes then
+        local kind = type(value)
+
+        rendered = rendered and (rendered .. ": " .. kind) or kind
+    end
+
+    if format.parameterValues == true or defaults then
+        local formatted = format_client_value(value, format)
+
+        rendered = rendered and (rendered .. " = " .. formatted) or formatted
+    end
+
+    return rendered
+end
+
+---@param handle  moonbug.ThreadHandle
+---@param ordinal integer
+---@param info    debuginfo
+---@param format  moonbug.dap.StackFrameFormat
+---@return string[]?
+local function stack_frame_parameters(handle, ordinal, info, format)
+    if ordinal == 0 or format.parameters == false then
+        return nil
+    end
+
+    local has_details = format.parameterNames ~= nil or format.parameterTypes ~= nil or format.parameterValues ~= nil
+    local defaults = format.parameters == true and not has_details
+
+    if not (format.parameters or format.parameterNames or format.parameterTypes or format.parameterValues) then
+        return nil
+    end
+
+    local parameters = {}
+    local count = info.nparams or 0
+
+    for index = 1, count do
+        local name, value = frame_getlocal(handle, ordinal, index)
+        if name then
+            local formatted = format_stack_parameter(name, value, index, format, defaults)
+            if formatted then
+                parameters[#parameters + 1] = formatted
+            end
+        end
+    end
+
+    return parameters
 end
 
 ---@param req moonbug.dap.StackTraceRequest
 function RequestHandler.handle_stack_trace(req)
     local args = req.arguments or {}
     local target = get_thread_handle_from_id(args.threadId or main_thread_id)
+    local format = args.format or {}
 
     if not target then
         session_send_error(req, "invalid threadId")
@@ -2279,27 +2708,50 @@ function RequestHandler.handle_stack_trace(req)
     ---@type moonbug.dap.StackFrame[]
     local frames = {}
     local target_ctx = get_context(target)
+
     ---@param info debuginfo
     ---@param frame_depth integer
     local function push_frame(info, frame_depth)
-        local name = info.name or "(anonymous)"
+        local parameters = stack_frame_parameters(target, frame_depth, info, format)
+        local name = info.name or (info.what == "C" and "[C]" or "(anonymous)")
+
+        if parameters then
+            name = name .. "(" .. table.concat(parameters, ", ") .. ")"
+        end
+
+        if format.module then
+            name = string.format("%s.%s", info.short_src:match "[^/\\]+$" or info.short_src, name)
+        end
+
+        if format.line and info.currentline and info.currentline > 0 then
+            name = string.format("%s:%d", name, info.currentline)
+        end
+
         local line = info.currentline or 0
-        local path = path_resolve(info.source, session.project_root_dir)
+        local path = info.source
+                and info.source:sub(1, 1) == "@"
+                and path_resolve(info.source, session.project_root_dir)
+            or ""
 
         if path ~= "" then
             session.sources[path] = true
         end
 
-        table.insert(frames, {
+        local frame = {
             id = session.next_frame_id,
             name = name,
-            line = line,
-            column = 1,
-            source = {
+            line = position_to_client(line, "line"),
+            column = position_to_client(1, "column"),
+        }
+
+        if path ~= "" then
+            frame.source = {
                 path = path,
                 name = (info.short_src or ""):match "[^/\\]+$" or info.short_src,
-            },
-        })
+            }
+        end
+
+        table.insert(frames, frame)
 
         target_ctx.frames[session.next_frame_id] = frame_depth
         session.next_frame_id = session.next_frame_id + 1
@@ -2310,8 +2762,8 @@ function RequestHandler.handle_stack_trace(req)
         table.insert(frames, {
             id = session.next_frame_id,
             name = "unable to access main thread while in a coroutine",
-            line = 0,
-            column = 1,
+            line = position_to_client(1, "line"),
+            column = position_to_client(1, "column"),
         })
 
         session.next_frame_id = session.next_frame_id + 1
@@ -2320,34 +2772,44 @@ function RequestHandler.handle_stack_trace(req)
         local is_foreign_handle = target ~= current_handle()
         local depth = is_foreign_handle and 1 or 2
         local ordinal = 0
+        local include_all = format.includeAll == true
 
         while true do
             local info = nil
 
             if is_foreign_handle then
                 ---@cast target thread
-                info = debug.getinfo(target, depth, "Snl")
+                info = debug.getinfo(target, depth, "Snlu")
             else
-                info = debug.getinfo(depth, "Snl")
+                info = debug.getinfo(depth, "Snlu")
             end
 
             if not info then
                 break
             end
 
+            local frame_depth = 0
+
             if is_user_frame(info) then
                 ordinal = ordinal + 1
-                push_frame(info, ordinal)
+                frame_depth = ordinal
+            end
+
+            if frame_depth > 0 or include_all then
+                push_frame(info, frame_depth)
             end
 
             depth = depth + 1
         end
     end
 
-    session_send_response(req, true, {
+    ---@type moonbug.dap.StackTraceResponseBody
+    local body = {
         stackFrames = frames,
         totalFrames = #frames,
-    })
+    }
+
+    session_send_response(req, true, body)
 end
 
 ---@param req moonbug.dap.ContinueRequest
@@ -2367,7 +2829,10 @@ function RequestHandler.handle_continue(req)
 
     set_resume_location(curr_handle, curr_ctx.stack_level, false)
 
-    session_send_response(req, true, { allThreadsContinued = true })
+    ---@type moonbug.dap.ContinueResponseBody
+    local body = { allThreadsContinued = true }
+
+    session_send_response(req, true, body)
     session_send_event(dap_events.continued, { threadId = curr_ctx.id, allThreadsContinued = true })
 end
 
@@ -2477,7 +2942,10 @@ function RequestHandler.handle_scopes(req)
         expensive = false,
     })
 
-    session_send_response(req, true, { scopes = scopes })
+    ---@type moonbug.dap.ScopesResponseBody
+    local body = { scopes = scopes }
+
+    session_send_response(req, true, body)
 end
 
 ---@param req moonbug.dap.VariablesRequest
@@ -2511,7 +2979,14 @@ function RequestHandler.handle_variables(req)
 
         while name do
             if not is_pseudo_variable(name) then
-                table.insert(variables, serialize_value(value, name, { context = "locals" }))
+                table.insert(
+                    variables,
+                    serialize_value(value, name, {
+                        context = "locals",
+                        evaluate_name = name,
+                        format = args.format,
+                    })
+                )
             end
 
             i = i + 1
@@ -2526,7 +3001,14 @@ function RequestHandler.handle_variables(req)
 
         while name do
             if not hidden_keys[name] then
-                table.insert(variables, serialize_value(value, name, { context = "upvalues" }))
+                table.insert(
+                    variables,
+                    serialize_value(value, name, {
+                        context = "upvalues",
+                        evaluate_name = name,
+                        format = args.format,
+                    })
+                )
             end
 
             i = i + 1
@@ -2534,14 +3016,15 @@ function RequestHandler.handle_variables(req)
             name, value = debug.getupvalue(ref.data.func, i)
         end
     elseif ref.kind == "globals" then
-        variables = global_variables()
+        variables = global_variables(args.format)
     elseif ref.kind == "table" then
         assert(ref.data.tbl, "tables must have `tbl` value")
 
         if supports_paging then
-            variables = table_variables(ref.data.tbl, args.filter, args.start, args.count)
+            variables =
+                table_variables(ref.data.tbl, args.filter, args.start, args.count, ref.data.evaluate_name, args.format)
         else
-            variables = table_variables(ref.data.tbl, args.filter)
+            variables = table_variables(ref.data.tbl, args.filter, nil, nil, ref.data.evaluate_name, args.format)
         end
     end
 
@@ -2554,7 +3037,10 @@ function RequestHandler.handle_variables(req)
         variables = slice(variables, args.start, args.count)
     end
 
-    session_send_response(req, true, { variables = variables })
+    ---@type moonbug.dap.VariablesResponseBody
+    local body = { variables = variables }
+
+    session_send_response(req, true, body)
 end
 
 ---@param req moonbug.dap.EvaluateRequest
@@ -2585,12 +3071,13 @@ function RequestHandler.handle_evaluate(req)
     local timeout = eval_timeout()
 
     ---@cast res table<integer, any>
-    local result = run_with_timeout(function()
+    local result, timeout_err = run_with_timeout(function()
         -- run inside timeout to guard from busy loading metamethods
-        return serialize_eval_result(res, count)
+        return serialize_eval_result(res, count, args.format)
     end, timeout)
 
     if not result then
+        session_send_error(req, timeout_err or "timeout")
         return
     end
 
@@ -2599,14 +3086,102 @@ function RequestHandler.handle_evaluate(req)
         return
     end
 
-    session_send_response(req, true, result[2])
+    ---@type moonbug.dap.EvaluateResponseBody
+    local body = result[2]
+
+    session_send_response(req, true, body)
+end
+
+---@param req moonbug.dap.SetExpressionRequest
+function RequestHandler.handle_set_expression(req)
+    if not session_requires_pause(req) then
+        return
+    end
+
+    local args = req.arguments or {}
+
+    if type(args.expression) ~= "string" or args.expression == "" then
+        session_send_error(req, "invalid expression")
+        return
+    end
+
+    if type(args.value) ~= "string" then
+        session_send_error(req, "invalid value")
+        return
+    end
+
+    local ordinal = nil
+
+    if args.frameId ~= nil then
+        local frame_handle, depth = find_frame(args.frameId)
+
+        if not frame_handle or not depth then
+            session_send_error(req, "invalid frameId")
+            return
+        end
+
+        if frame_handle ~= current_handle() then
+            session_send_error(req, "cannot evaluate in a suspended thread")
+            return
+        end
+
+        ordinal = depth
+    end
+
+    -- vararg carries the assigned value w/o introducing a temp name that could shadow a var in the selected frame
+    local assignment =
+        string.format("return (function(...) %s = ...; return ... end)((%s))", args.expression, args.value)
+
+    local ok, values = evaluate_expr(ordinal, assignment, nil, "repl")
+    if not ok then
+        ---@cast values string
+        session_send_error(req, values or "failed to set expression")
+        return
+    end
+
+    ---@cast values table<integer, any>
+    local serialized, serialization_err = run_with_timeout(function()
+        return serialize_value(values[1], args.expression, {
+            context = "eval",
+            format = args.format,
+        })
+    end, eval_timeout())
+
+    if not serialized then
+        session_send_error(req, serialization_err or "timeout")
+        return
+    end
+
+    if not serialized[1] then
+        session_send_error(req, tostring(serialized[2]) or "failed to serialize set expression result")
+        return
+    end
+
+    local variable = serialized[2]
+
+    ---@type moonbug.dap.SetExpressionResponseBody
+    local body = {
+        value = variable.value,
+        presentationHint = variable.presentationHint,
+        variablesReference = variable.variablesReference,
+        indexedVariables = variable.indexedVariables,
+        namedVariables = variable.namedVariables,
+    }
+
+    if session.client_args and session.client_args.supportsVariableType then
+        body.type = variable.type
+    end
+
+    session_send_response(req, true, body)
 end
 
 ---@param req moonbug.dap.CompletionsRequest
 function RequestHandler.handle_completions(req)
     local args = req.arguments or {}
     local text = args.text or ""
-    local column = args.column or 1
+    local column = position_from_client(args.column or 1, "column")
+
+    ---@cast column integer
     local base, prefix, separator, prefix_start = split_completion_input(text, column)
 
     ---@type moonbug.dap.CompletionItem[]
@@ -2615,12 +3190,15 @@ function RequestHandler.handle_completions(req)
     if session.paused then
         local frame_handle = nil
         local depth = nil
+
         if args.frameId then
             frame_handle, depth = find_frame(args.frameId)
         end
+
         if base then
             -- member completion, resolve the base expr and then enumerate keys
             local base_value = nil
+
             if depth then
                 if frame_handle == current_handle() then
                     local ok, res = evaluate_expr(depth, base, nil, "watch")
@@ -2631,6 +3209,7 @@ function RequestHandler.handle_completions(req)
             elseif _G[base] ~= nil then
                 base_value = _G[base]
             end
+
             if type(base_value) == "table" then
                 targets = complete_fields(base_value, prefix, separator)
             end
@@ -2640,7 +3219,7 @@ function RequestHandler.handle_completions(req)
         else
             -- no usable frame: globals only
             for _, k in ipairs(global_keys()) do
-                if k:sub(1, #prefix) == prefix then
+                if str_starts_with(k, prefix) then
                     table.insert(targets, {
                         label = k,
                         text = k,
@@ -2652,15 +3231,19 @@ function RequestHandler.handle_completions(req)
     end
 
     for _, t in ipairs(targets) do
-        t.start = prefix_start
+        t.start = position_to_client(prefix_start, "column")
         t.length = #prefix
     end
 
-    session_send_response(req, true, { targets = targets })
+    ---@type moonbug.dap.CompletionsResponseBody
+    local body = { targets = targets }
+
+    session_send_response(req, true, body)
 end
 
 ---@param req moonbug.dap.LoadedSourcesRequest
 function RequestHandler.handle_loaded_sources(req)
+    ---@type moonbug.dap.Source[]
     local sources = {}
 
     for path in pairs(session.sources) do
@@ -2674,18 +3257,22 @@ function RequestHandler.handle_loaded_sources(req)
         return a.path < b.path
     end)
 
-    session_send_response(req, true, {
+    ---@type moonbug.dap.LoadedSourcesResponseBody
+    local body = {
         sources = sources,
-    })
+    }
+
+    session_send_response(req, true, body)
 end
 
 ---@param req moonbug.dap.ModulesRequest
 function RequestHandler.handle_modules(req)
+    ---@type moonbug.dap.Module[]
     local list = {}
 
     for name in pairs(package.loaded) do
         if type(name) == "string" then
-            table.insert(list, register_module(name) or { id = session.module_ids[name], name = name })
+            table.insert(list, register_module(name))
         end
     end
 
@@ -2697,10 +3284,13 @@ function RequestHandler.handle_modules(req)
     local start_module = args.startModule or 0
     local count = args.moduleCount
 
-    session_send_response(req, true, {
+    ---@type moonbug.dap.ModulesResponseBody
+    local body = {
         totalModules = #list,
         modules = slice(list, start_module, count),
-    })
+    }
+
+    session_send_response(req, true, body)
 end
 
 ---@param req moonbug.dap.ExceptionInfoRequest
@@ -2726,7 +3316,8 @@ function RequestHandler.handle_exception_info(req)
         return
     end
 
-    session_send_response(req, true, {
+    ---@type moonbug.dap.ExceptionInfoResponseBody
+    local body = {
         exceptionId = "error",
         description = exception.message,
         breakMode = exception.caught and "always" or "unhandled",
@@ -2734,7 +3325,9 @@ function RequestHandler.handle_exception_info(req)
             message = exception.message,
             stackTrace = capture_stacktrace(),
         },
-    })
+    }
+
+    session_send_response(req, true, body)
 end
 
 ---@param req moonbug.dap.LaunchRequest
@@ -2771,6 +3364,8 @@ end
 
 ---@param req moonbug.dap.DisconnectRequest
 function RequestHandler.handle_disconnect(req)
+    local args = req.arguments or {}
+
     local curr_handle = current_handle()
     local curr_ctx = get_context(curr_handle)
 
@@ -2781,9 +3376,13 @@ function RequestHandler.handle_disconnect(req)
     session.step = nil
 
     session_send_response(req, true)
-    remove_debug_hook()
 
-    uninstall_wrappers()
+    if args.restart then
+        session.terminate_requested = true
+    else
+        remove_debug_hook()
+        uninstall_wrappers()
+    end
 
     if session.client then
         pcall(function()
@@ -2857,7 +3456,7 @@ function RequestHandler.handle_set_variable(req)
         return
     end
 
-    local new_value = res[1] or nil
+    local new_value = res[1]
 
     if ref.kind == "locals" then
         local i = 1
@@ -2907,17 +3506,40 @@ function RequestHandler.handle_set_variable(req)
         return
     end
 
-    local serialized = serialize_value(new_value, name, { context = ref.kind })
-    session_send_response(req, true, serialized)
+    local evaluate_name = nil
+
+    if ref.kind == "locals" or ref.kind == "upvalues" then
+        evaluate_name = name
+    elseif ref.kind == "globals" then
+        evaluate_name = global_evaluate_name(name)
+    elseif ref.kind == "table" then
+        evaluate_name = table_evaluate_name(ref.data.evaluate_name, table_key_from_name(name))
+    end
+
+    local serialized = serialize_value(new_value, name, {
+        context = ref.kind,
+        evaluate_name = evaluate_name,
+    })
+
+    ---@type moonbug.dap.SetVariableResponseBody
+    local body = serialized
+    session_send_response(req, true, body)
 end
 
 ---@param req moonbug.dap.Request
 local function dispatch(req)
-    log.debug("dispatch command: %s", req.command)
+    log.debug("request command: %s", req.command)
 
     local handler_name = string.format("handle_%s", camel2snake(req.command))
 
     if RequestHandler[handler_name] then
+        local args_str = ""
+
+        if req.arguments then
+            args_str = string.format(" - args: %s", readable_tostring(req.arguments))
+        end
+
+        log.debug("dispatch command (seq: %d): %s%s", req.seq, req.command, args_str)
         RequestHandler[handler_name](req)
         return
     end
@@ -3535,8 +4157,15 @@ end
 function M.listen(host, port, opts)
     -- save the initial session config for later
     if not started_once then
-        log.info("Hello Moonbug v%s", M.version_string())
-        log.info("Runtime: %s%s", _VERSION, is_luajit and " JIT" or "")
+        log.info(
+            "Hello Moonbug %s",
+            readable_tostring {
+                lua_version = _VERSION,
+                luajit = is_luajit,
+                moonbug_version = M.version_string(),
+                start_options = opts,
+            }
+        )
 
         start_host = host
         start_port = port
@@ -3631,6 +4260,7 @@ if os.getenv "MOONBUG_TEST" then
         },
         helpers = {
             camel2snake = camel2snake,
+            str_starts_with = str_starts_with,
         },
     }
 end
