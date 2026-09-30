@@ -1053,29 +1053,68 @@ local dap_events = {
 ---@field visibility? "public"|"private"|"protected"|"internal"|"final"
 ---@field lazy?       boolean
 
+---@class moonbug.DapReadState
+---@field header_partial  string
+---@field headers_done    boolean
+---@field content_length  integer?
+---@field payload_partial string
+
+---@type table<moonbug.Socket, moonbug.DapReadState>
+local dap_read_states = setmetatable({}, { __mode = "k" })
+
+---@param client moonbug.Socket
+---@return moonbug.DapReadState
+local function dap_read_state(client)
+    local state = dap_read_states[client]
+
+    if not state then
+        state = {
+            header_partial = "",
+            headers_done = false,
+            payload_partial = "",
+        }
+        dap_read_states[client] = state
+    end
+
+    return state
+end
+
 ---@param client moonbug.Socket
 ---@return integer?
 ---@return string?
 local function parse_content_length(client)
     assert(client, "socket client can't be nil")
-    local content_length = nil
+    local state = dap_read_state(client)
 
-    while true do
-        local line, err = client:receive "*l"
+    while not state.headers_done do
+        local line, err, partial = client:receive("*l", state.header_partial)
         if not line then
+            state.header_partial = partial or state.header_partial
+
             if err == "closed" then
+                dap_read_states[client] = nil
                 return nil, "closed"
             elseif err == "timeout" then
                 return nil, "timeout"
             end
 
             log.error("socket read error: %s", tostring(err))
+
             return nil, err
         end
 
+        state.header_partial = ""
+
         -- dap headers end with an empty line
         if line == "" then
-            break
+            state.headers_done = true
+
+            if not state.content_length then
+                dap_read_states[client] = nil
+                return nil, "missing Content-Length"
+            end
+
+            return state.content_length, nil
         end
 
         local length_str = line:match "^content%-length%s*:%s*(%d+)%s*$"
@@ -1085,11 +1124,11 @@ local function parse_content_length(client)
         end
 
         if length_str then
-            content_length = tonumber(length_str)
+            state.content_length = tonumber(length_str)
         end
     end
 
-    return content_length, nil
+    return state.content_length, nil
 end
 
 ---@param client moonbug.Socket
@@ -1103,11 +1142,21 @@ local function read_message(client)
         return nil, length_err
     end
 
-    local payload, payload_err = client:receive(length)
+    local state = dap_read_state(client)
+    local payload, payload_err, partial = client:receive(length, state.payload_partial)
+
     if not payload then
+        state.payload_partial = partial or state.payload_partial
+
+        if payload_err == "closed" then
+            dap_read_states[client] = nil
+        end
+
         log.error("failed to read payload of length %d: %s", length, tostring(payload_err))
         return nil, payload_err
     end
+
+    dap_read_states[client] = nil
 
     log.trace("read_message(%d): %s", length, payload)
 
@@ -1250,27 +1299,27 @@ end
 ---@field left   boolean
 
 ---@class moonbug.Session
----@field client?             moonbug.Socket
----@field server?             moonbug.Socket
----@field seq                 integer
----@field ready               boolean True after `configurationDone`
----@field paused              boolean
----@field context             table<moonbug.ThreadHandle, moonbug.ThreadContext>
----@field step?               "in"|"over"|"out"|"pause"|"entry"
----@field step_level          integer
----@field step_thread?        moonbug.ThreadHandle
----@field resume_location?    moonbug.ResumeLocation
----@field breakpoints         table<string, table<integer, moonbug.Breakpoint>>
----@field filters             { error: boolean, pcall: boolean, uncaught: boolean }
----@field client_args?        moonbug.dap.InitializeRequestArguments
----@field config?             moonbug.Config
----@field project_root_dir?   string
----@field variables           { next_id: integer, refs: table<integer, { kind: moonbug.VariableKind, data: table }> }
----@field next_frame_id       integer
----@field terminate_requested boolean
----@field sources             table<string, true>
----@field module_ids          table<string, integer>
----@field next_module_id      integer
+---@field client?           moonbug.Socket
+---@field server?           moonbug.Socket
+---@field seq               integer
+---@field ready             boolean True after `configurationDone`
+---@field paused            boolean
+---@field context           table<moonbug.ThreadHandle, moonbug.ThreadContext>
+---@field step?             "in"|"over"|"out"|"pause"|"entry"
+---@field step_level        integer
+---@field step_thread?      moonbug.ThreadHandle
+---@field resume_location?  moonbug.ResumeLocation
+---@field breakpoints       table<string, table<integer, moonbug.Breakpoint>>
+---@field filters           { error: boolean, pcall: boolean, uncaught: boolean }
+---@field client_args?      moonbug.dap.InitializeRequestArguments
+---@field config?           moonbug.Config
+---@field project_root_dir? string
+---@field variables         { next_id: integer, refs: table<integer, { kind: moonbug.VariableKind, data: table }> }
+---@field next_frame_id     integer
+---@field restart_requested boolean
+---@field sources           table<string, true>
+---@field module_ids        table<string, integer>
+---@field next_module_id    integer
 local session = {
     seq = 0,
     ready = false,
@@ -1286,7 +1335,7 @@ local session = {
         next_id = 1,
         refs = {},
     },
-    terminate_requested = false,
+    restart_requested = false,
     sources = {},
     module_ids = {},
     next_module_id = 1,
@@ -1326,7 +1375,7 @@ local function session_reset(with_restart)
     session.config = nil
     session.project_root_dir = nil
     session.next_frame_id = 1
-    session.terminate_requested = false
+    session.restart_requested = false
     session.sources = {}
     session.module_ids = {}
     session.next_module_id = 1
@@ -3338,9 +3387,9 @@ function RequestHandler.handle_launch(req)
         session.project_root_dir = args.project_root_dir or args.cwd or args["workspaceFolder"]
     end
 
-    -- still not applied...
     if not session.project_root_dir then
-        log.fatal "launch config `project_root_dir` is missing, aborting..."
+        session_send_error(req, "missing project root (`project_root_dir` or `cwd`)")
+        return
     end
 
     session_send_response(req, true)
@@ -3354,9 +3403,9 @@ function RequestHandler.handle_attach(req)
         session.project_root_dir = args.project_root_dir or args.cwd or args["workspaceFolder"]
     end
 
-    -- still not applied...
     if not session.project_root_dir then
-        log.fatal "launch config `project_root_dir` is missing, aborting..."
+        session_send_error(req, "missing project root (`project_root_dir` or `cwd`)")
+        return
     end
 
     session_send_response(req, true)
@@ -3378,7 +3427,7 @@ function RequestHandler.handle_disconnect(req)
     session_send_response(req, true)
 
     if args.restart then
-        session.terminate_requested = true
+        session.restart_requested = true
     else
         remove_debug_hook()
         uninstall_wrappers()
@@ -3393,25 +3442,10 @@ end
 
 ---@param req moonbug.dap.TerminateRequest
 function RequestHandler.handle_terminate(req)
-    local curr_handle = current_handle()
-    local curr_ctx = get_context(curr_handle)
-
-    curr_ctx.frames = {}
-    session.variables.refs = {}
-    session.ready = false
-    session.paused = false
-    session.step = nil
-
     session_send_response(req, true)
     session_send_event(dap_events.terminated)
 
-    session.terminate_requested = true
-
-    if session.client then
-        pcall(function()
-            session.client:close()
-        end)
-    end
+    os.exit(0) -- quit the process
 end
 
 ---@param req moonbug.dap.SetVariableRequest
@@ -3983,8 +4017,8 @@ debug_hook = function(event, line)
         saved_hook(event, line, 3)
     end
 
-    if session.terminate_requested then
-        log.warning("moonbug: debuggee terminated", 0)
+    if session.restart_requested then
+        log.warning("moonbug: restart requested", 0)
         session_reset(true)
         return
     end
