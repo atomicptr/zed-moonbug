@@ -1,7 +1,7 @@
 id = "moonbug-debugger"
 name = "moonbug"
 description = "Single-file, in-process, DAP powered Lua debugger for your favorite code editor!"
-version = "0.1.0"
+version = "0.1.1"
 schema_version = 1
 authors = ["Christopher Kaster <me@atomicptr.de>"]
 repository = "https://github.com/atomicptr/zed-moonbug"
